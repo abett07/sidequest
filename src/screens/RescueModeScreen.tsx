@@ -93,13 +93,13 @@ export default function RescueModeScreen() {
             >
               <GlassPanel
                 onPress={() => handleSelect(state.key)}
-                style={[
-                  styles.emotionCard,
-                  selected === state.key && {
+                style={{
+                  ...styles.emotionCard,
+                  ...(selected === state.key ? {
                     borderColor: `${COLORS.purple}55`,
                     backgroundColor: `${COLORS.purple}12`,
-                  },
-                ]}
+                  } : {}),
+                }}
                 padding={20}
               >
                 <Text style={{ fontSize: 36, textAlign: 'center' }}>{state.icon}</Text>

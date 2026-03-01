@@ -8,6 +8,7 @@
 
 import { MMKV } from 'react-native-mmkv';
 import { supabase } from '../supabase/client';
+import { getLocalDateKey } from '../utils/date';
 import type { Quest, QuestStep, UserProfile, UserStats, UserPreferences, FocusSession, StateCheckin } from '../types';
 
 const cache = new MMKV({ id: 'shadow-cache' });
@@ -34,13 +35,30 @@ interface OutboxEntry {
   payload: Record<string, unknown>;
   matchKey: string; // which field to match on for update/delete (default: 'id')
   createdAt: string;
+  dedupeKey?: string;
 }
 
 // #7 FIX: Returns the generated id so callers can clear the exact entry
-function pushOutbox(entry: Omit<OutboxEntry, 'id' | 'createdAt'>): string {
+function pushOutbox(entry: Omit<OutboxEntry, 'id' | 'createdAt'> & { dedupeKey?: string }): string {
+  const queue = getOutboxQueue().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  if (entry.dedupeKey) {
+    const existing = queue.find((q) => q.dedupeKey && q.dedupeKey === entry.dedupeKey);
+    if (existing) return existing.id;
+  }
+
+  const targetId = entry.payload[entry.matchKey || 'id'];
+  if (targetId !== undefined && entry.operation !== 'delete') {
+    const coalesced = queue.filter((q) => {
+      const qTarget = q.payload[q.matchKey || 'id'];
+      return !(q.table === entry.table && q.operation === entry.operation && qTarget === targetId);
+    });
+    queue.length = 0;
+    queue.push(...coalesced);
+  }
+
   const id = `ob_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const full: OutboxEntry = { ...entry, id, createdAt: new Date().toISOString() };
-  const queue = getOutboxQueue();
   queue.push(full);
   outboxStore.set('queue', JSON.stringify(queue));
   return id;
@@ -96,8 +114,9 @@ async function pushAndTryWrite(
   operation: 'upsert' | 'update' | 'delete',
   payload: Record<string, unknown>,
   matchKey: string = 'id',
+  dedupeKey?: string,
 ): Promise<void> {
-  const outboxId = pushOutbox({ table, operation, payload, matchKey });
+  const outboxId = pushOutbox({ table, operation, payload, matchKey, dedupeKey });
   try {
     if (operation === 'upsert') {
       const { error } = await supabase.from(table).upsert(payload);
@@ -124,6 +143,15 @@ async function pushAndTryWrite(
 
 // ─── Profiles (was "users") ───
 
+
+export interface ProfileProgressionSnapshot {
+  streak: number;
+  combo: number;
+  lastActiveDate: string | null;
+  lastStreakDate: string | null;
+  graceUsedAt: string | null;
+}
+
 export const profilesRepo = {
   async fetchProfile(userId: string): Promise<UserProfile | null> {
     try {
@@ -139,6 +167,23 @@ export const profilesRepo = {
       }
     } catch {}
     return cacheGet<UserProfile>(`user:${userId}`);
+  },
+
+
+  async fetchProgression(userId: string): Promise<ProfileProgressionSnapshot | null> {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('streak, combo, last_active_date, last_streak_date, grace_used_at')
+        .eq('id', userId)
+        .single();
+      if (data && !error) {
+        const mapped = mapDbProgression(data);
+        cacheSet(`progression:${userId}`, mapped);
+        return mapped;
+      }
+    } catch {}
+    return cacheGet<ProfileProgressionSnapshot>(`progression:${userId}`);
   },
 
   async updateProfile(userId: string, partial: Partial<UserProfile>): Promise<void> {
@@ -158,7 +203,7 @@ export const profilesRepo = {
       xp_total: data.xpTotal, level: data.level,
       xp_to_next: data.xpToNext, rank: data.rank,
       coins: data.coins, streak: data.streak, combo: data.combo,
-      last_active_date: new Date().toISOString().slice(0, 10),
+      last_active_date: getLocalDateKey(new Date()),
     };
     if (data.statPoints !== undefined) dbPayload.stat_points = data.statPoints;
     await pushAndTryWrite('profiles', 'update', { id: userId, ...dbPayload });
@@ -344,30 +389,62 @@ export const stateRepo = {
 // ─── Server RPCs (#9, #10) ───
 
 export async function rpcCompleteQuest(
-  userId: string, questId: string, xpEarned: number, coinsEarned: number,
-): Promise<{ ok: boolean; new_xp_total?: number; new_streak?: number; error?: string }> {
+  questId: string, xpEarned: number, coinsEarned: number, clientMutationId?: string,
+): Promise<{ xp_total?: number; level?: number; rank?: string; streak?: number; coins?: number; error?: string }> {
   try {
     const { data, error } = await supabase.rpc('complete_quest', {
-      p_user_id: userId, p_quest_id: questId, p_xp_earned: xpEarned, p_coins_earned: coinsEarned,
+      p_quest_id: questId,
+      p_xp_earned: xpEarned,
+      p_coins_earned: coinsEarned,
+      p_client_mutation_id: clientMutationId || null,
     });
     if (error) throw error;
-    return data;
+    return data || {};
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'RPC failed' };
+    return { error: e?.message || 'RPC failed' };
+  }
+}
+
+
+export async function rpcCompleteFocusSession(params: {
+  session: FocusSession;
+  xpEarned: number;
+  clientMutationId?: string;
+}): Promise<{ xp_total?: number; level?: number; rank?: string; xp_to_next?: number; error?: string }> {
+  try {
+    const { session, xpEarned, clientMutationId } = params;
+    const { data, error } = await supabase.rpc('complete_focus_session', {
+      p_session_id: session.id,
+      p_quest_id: session.questId || null,
+      p_session_type: session.sessionType,
+      p_planned_minutes: session.plannedMinutes,
+      p_actual_minutes: session.actualMinutes,
+      p_distraction_count: session.distractionCount,
+      p_quality_score: session.qualityScore,
+      p_completed: session.completed,
+      p_started_at: session.startedAt,
+      p_ended_at: session.endedAt || null,
+      p_xp_earned: xpEarned,
+      p_client_mutation_id: clientMutationId || null,
+    });
+    if (error) throw error;
+    return data || {};
+  } catch (e: any) {
+    return { error: e?.message || 'RPC failed' };
   }
 }
 
 export async function rpcUnlockSkill(
-  userId: string, nodeKey: string, cost: number = 1,
-): Promise<{ ok: boolean; stat_bonus?: Record<string, number>; remaining_points?: number; error?: string }> {
+  nodeKey: string,
+): Promise<{ unlocked?: string; stat_bonus?: Record<string, number>; error?: string }> {
   try {
     const { data, error } = await supabase.rpc('unlock_skill_node', {
-      p_user_id: userId, p_node_key: nodeKey, p_cost: cost,
+      p_node_key: nodeKey,
     });
     if (error) throw error;
     return data;
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'RPC failed' };
+    return { error: e?.message || 'RPC failed' };
   }
 }
 
@@ -449,6 +526,16 @@ function mapDbSkillNode(row: any): any {
 // ═══════════════════════════════════════════════════
 // DB ↔ App mappers
 // ═══════════════════════════════════════════════════
+
+function mapDbProgression(row: any): ProfileProgressionSnapshot {
+  return {
+    streak: row.streak || 0,
+    combo: row.combo || 0,
+    lastActiveDate: row.last_active_date || null,
+    lastStreakDate: row.last_streak_date || null,
+    graceUsedAt: row.grace_used_at || null,
+  };
+}
 
 function mapDbUser(row: any): UserProfile {
   return {

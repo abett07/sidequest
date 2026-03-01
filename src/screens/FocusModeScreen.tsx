@@ -33,7 +33,7 @@ export default function FocusModeScreen() {
   const initialSession = route.params?.sessionType as SessionType | undefined;
   const quest = useQuestById(questId);
 
-  const { startFocusSession, endFocusSession, logDistraction, addXP, activeFocusSession } = useShadowStore();
+  const { startFocusSession, endFocusSession, logDistraction, addXP, activeFocusSession, user } = useShadowStore();
 
   const [phase, setPhase] = useState<'select' | 'active' | 'complete'>('select');
   const [sessionType, setSessionType] = useState<SessionType | null>(initialSession || null);
@@ -66,7 +66,7 @@ export default function FocusModeScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
 
     startFocusSession({
-      userId: '',
+      userId: user.id,
       questId,
       sessionType: type,
       plannedMinutes: minutes,

@@ -47,7 +47,7 @@ export function SkillTreeScreen() {
   const stats = useShadowStore((s) => s.stats);
 
   // Use seed nodes if store is empty (before DB sync)
-  const nodes = storeNodes.length > 0 ? storeNodes : SEED_NODES as any[];
+  const nodes = storeNodes.length > 0 ? storeNodes : [...SEED_NODES] as any[];
   const unlockedKeys = new Set(unlockedSkills.map((us) => us.skillNodeId));
 
   // Compute state for each node

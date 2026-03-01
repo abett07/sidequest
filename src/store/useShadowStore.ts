@@ -17,10 +17,12 @@ import {
   profilesRepo, prefsRepo, statsRepo,
   questsRepo, stepsRepo, focusRepo, stateRepo,
   skillNodesRepo, rewardsRepo, achievementsRepo,
-  flushOutbox,
+  flushOutbox, rpcCompleteQuest, rpcCompleteFocusSession,
 } from '../data/sync';
 import { computeRules, xpForLevel, getRankForLevel, type SystemRules } from '../utils/coreLogic';
+import { getLocalDateKey } from '../utils/date';
 import { supabase } from '../supabase/client';
+import { v4 as uuidv4 } from 'uuid';
 import type {
   UserProfile, UserStats, UserPreferences,
   Quest, QuestStep, Campaign, BuffDebuff,
@@ -47,11 +49,11 @@ function isSameDay(d1: string | null, d2: string | null): boolean {
   return d1.slice(0, 10) === d2.slice(0, 10);
 }
 
-function isYesterday(dateStr: string | null): boolean {
+function isYesterday(dateStr: string | null, timezone?: string): boolean {
   if (!dateStr) return false;
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
-  return dateStr.slice(0, 10) === yesterday.toISOString().slice(0, 10);
+  return dateStr.slice(0, 10) === getLocalDateKey(yesterday, timezone);
 }
 
 function daysBetween(d1: string, d2: string): number {
@@ -119,6 +121,9 @@ interface ShadowStore {
   startFocusSession: (session: Omit<FocusSession, 'id' | 'startedAt' | 'actualMinutes' | 'completed' | 'distractionCount' | 'qualityScore'>) => void;
   endFocusSession: (completed: boolean, qualityScore: number) => void;
   logDistraction: () => void;
+  completingQuestIds: string[];
+  completedFocusSessionIds: string[];
+  recoverActiveFocusSession: () => void;
 
   // ── Progression System (date-aware) ──
   streak: number;
@@ -329,57 +334,90 @@ export const useShadowStore = create<ShadowStore>()(
       },
 
       completeQuest: (questId) => {
+        const { completingQuestIds } = get();
+        if (completingQuestIds.includes(questId)) return;
+
         const quest = get().quests.find((q) => q.id === questId);
-        if (!quest) return;
+        if (!quest || quest.status === 'done') return;
 
-        // Calculate XP with multipliers + state engine
-        const { streak, combo, systemRules } = get();
-        let xp = quest.xpReward;
-        const streakBonus = Math.min(streak * XP_CONFIG.streakMultiplier, XP_CONFIG.streakMultiplierCap);
-        const comboBonus = Math.min(combo * XP_CONFIG.comboMultiplier, XP_CONFIG.comboMultiplierCap);
-        if (quest.questType === 'boss') xp *= XP_CONFIG.bossCompletionMultiplier;
-        xp = Math.round(xp * (1 + streakBonus + comboBonus) * systemRules.xpMultiplier);
+        set((s) => ({ completingQuestIds: [...s.completingQuestIds, questId] }));
 
-        get().addXP(xp, `quest:${questId}`);
-        get().addCoins(quest.coinReward);
-        get().recordQuestCompletion();
+        const nowIso = new Date().toISOString();
+        const previousQuest = quest;
 
+        // Temporary optimistic quest completion for immediate UI feedback.
         set((s) => ({
           quests: s.quests.map((q) =>
             q.id === questId
-              ? { ...q, status: 'done' as const, completedAt: new Date().toISOString() }
+              ? { ...q, status: 'done' as const, completedAt: nowIso }
               : q
           ),
         }));
 
-        // Phase 4: Auto battle log entry
-        get().addBattleEntry({
-          type: quest.questType === 'boss' ? 'boss_defeat' : 'quest_complete',
-          title: quest.questType === 'boss' ? `Boss Defeated: ${quest.title}` : `Quest Complete: ${quest.title}`,
-          description: `Earned ${xp} XP${quest.coinReward ? ` and ${quest.coinReward} coins` : ''}`,
-          xpEarned: xp,
-          icon: quest.questType === 'boss' ? '💀' : '⚔️',
-        });
+        const { streak, combo, systemRules } = get();
+        let xp = previousQuest.xpReward;
+        const streakBonus = Math.min(streak * XP_CONFIG.streakMultiplier, XP_CONFIG.streakMultiplierCap);
+        const comboBonus = Math.min(combo * XP_CONFIG.comboMultiplier, XP_CONFIG.comboMultiplierCap);
+        if (previousQuest.questType === 'boss') xp *= XP_CONFIG.bossCompletionMultiplier;
+        xp = Math.round(xp * (1 + streakBonus + comboBonus) * systemRules.xpMultiplier);
 
-        // FIX #9: Sync both the quest AND the updated profile
         const userId = get().user.id;
-        if (userId) {
-          const updated = get().quests.find((q) => q.id === questId);
-          if (updated) questsRepo.upsert(userId, updated).catch(() => {});
-
-          // FIX #9: Sync profile progression (XP, level, rank, coins, streak)
-          const { user, streak: newStreak, combo: newCombo } = get();
-          profilesRepo.syncProgression(userId, {
-            xpTotal: user.xpTotal,
-            level: user.level,
-            xpToNext: user.xpToNext,
-            rank: user.rank,
-            coins: user.coins,
-            streak: newStreak,
-            combo: newCombo,
-            statPoints: user.statPoints,
-          }).catch(() => {});
+        if (!userId) {
+          // No server identity yet: keep local completion flow.
+          get().addXP(xp, `quest:${questId}`);
+          get().addCoins(previousQuest.coinReward);
+          get().recordQuestCompletion();
+          set((s) => ({ completingQuestIds: s.completingQuestIds.filter((id) => id !== questId) }));
+          return;
         }
+
+        void (async () => {
+          const mutationId = `mq_${questId}_${new Date().toISOString()}`;
+          const rpcResult = await rpcCompleteQuest(questId, xp, previousQuest.coinReward, mutationId);
+          if (rpcResult.error) {
+            // Roll back optimistic quest state if server atomic completion fails.
+            set((s) => ({
+              quests: s.quests.map((q) =>
+                q.id === questId
+                  ? { ...q, status: previousQuest.status, completedAt: previousQuest.completedAt }
+                  : q
+              ),
+            }));
+            set((s) => ({ completingQuestIds: s.completingQuestIds.filter((id) => id !== questId) }));
+            return;
+          }
+
+          const today = getLocalDateKey(new Date(), get().user.timezone);
+          set((s) => ({
+            user: {
+              ...s.user,
+              xpTotal: rpcResult.xp_total ?? s.user.xpTotal,
+              level: rpcResult.level ?? s.user.level,
+              rank: (rpcResult.rank as Rank | undefined) ?? s.user.rank,
+              coins: rpcResult.coins ?? s.user.coins,
+              xpToNext: xpForLevel(rpcResult.level ?? s.user.level),
+            },
+            streak: rpcResult.streak ?? s.streak,
+            lastStreakDate: rpcResult.streak !== undefined ? today : s.lastStreakDate,
+            lastActiveDate: today,
+            todayXP: isSameDay(s.lastActiveDate, today) ? s.todayXP + xp : xp,
+            combo: s.combo + 1,
+            comboLastAction: nowIso,
+          }));
+
+          const updatedQuest = get().quests.find((q) => q.id === questId);
+          if (updatedQuest) questsRepo.upsert(userId, updatedQuest).catch(() => {});
+
+          get().addBattleEntry({
+            type: previousQuest.questType === 'boss' ? 'boss_defeat' : 'quest_complete',
+            title: previousQuest.questType === 'boss' ? `Boss Defeated: ${previousQuest.title}` : `Quest Complete: ${previousQuest.title}`,
+            description: `Earned ${xp} XP${previousQuest.coinReward ? ` and ${previousQuest.coinReward} coins` : ''}`,
+            xpEarned: xp,
+            icon: previousQuest.questType === 'boss' ? '💀' : '⚔️',
+          });
+
+          set((s) => ({ completingQuestIds: s.completingQuestIds.filter((id) => id !== questId) }));
+        })();
       },
 
       addQuestStep: (questId, step) => {
@@ -469,18 +507,24 @@ export const useShadowStore = create<ShadowStore>()(
 
         // Persist checkin
         const userId = get().user.id;
-        if (userId && partial.energy !== undefined) {
+        if (partial.energy !== undefined) {
           const state = get().currentState;
-          stateRepo.save(userId, {
+          const checkin: StateCheckin = {
             id: generateId('sc'),
-            userId,
-            mood: state.mood,
-            energy: state.energy,
-            stress: state.stress,
-            focus: state.focus,
+            userId: userId || get().user.id,
+            mood: state.mood as StateCheckin['mood'],
+            energy: state.energy as StateCheckin['energy'],
+            stress: state.stress as StateCheckin['stress'],
+            focus: state.focus as StateCheckin['focus'],
             stateTag: state.stateTag,
             createdAt: new Date().toISOString(),
-          }).catch(() => {});
+          };
+
+          get().addCheckin(checkin);
+
+          if (userId) {
+            stateRepo.save(userId, checkin).catch(() => {});
+          }
         }
       },
 
@@ -499,11 +543,13 @@ export const useShadowStore = create<ShadowStore>()(
       // ── Focus System ──
       activeFocusSession: null,
       focusHistory: [],
+      completingQuestIds: [],
+      completedFocusSessionIds: [],
 
       startFocusSession: (session) => {
         const newSession: FocusSession = {
           ...session,
-          id: generateId('fs'),
+          id: uuidv4(),
           startedAt: new Date().toISOString(),
           actualMinutes: 0,
           completed: false,
@@ -513,9 +559,28 @@ export const useShadowStore = create<ShadowStore>()(
         set({ activeFocusSession: newSession });
       },
 
+      recoverActiveFocusSession: () => {
+        const session = get().activeFocusSession;
+        if (!session) return;
+        if (get().completedFocusSessionIds.includes(session.id)) {
+          set({ activeFocusSession: null });
+          return;
+        }
+
+        const elapsedMinutes = Math.round((Date.now() - new Date(session.startedAt).getTime()) / 60000);
+        if (elapsedMinutes >= session.plannedMinutes) {
+          get().endFocusSession(true, session.qualityScore || 3);
+        }
+      },
+
       endFocusSession: (completed, qualityScore) => {
         const session = get().activeFocusSession;
         if (!session) return;
+
+        if (get().completedFocusSessionIds.includes(session.id)) {
+          set({ activeFocusSession: null });
+          return;
+        }
 
         const ended: FocusSession = {
           ...session,
@@ -528,14 +593,38 @@ export const useShadowStore = create<ShadowStore>()(
         set((s) => ({
           activeFocusSession: null,
           focusHistory: [ended, ...s.focusHistory].slice(0, 100), // keep last 100
+          completedFocusSessionIds: [ended.id, ...s.completedFocusSessionIds].slice(0, 200),
         }));
 
-        if (completed) {
-          get().addXP(Math.round(ended.plannedMinutes * 2), `focus:${ended.id}`);
+        const userId = get().user.id;
+        const xpEarned = completed ? Math.round(ended.plannedMinutes * 2) : 0;
+
+        if (completed && userId) {
+          const mutationId = `mf_${ended.id}_${new Date().toISOString()}`;
+          void rpcCompleteFocusSession({ session: ended, xpEarned, clientMutationId: mutationId })
+            .then((res) => {
+              if (res.error) {
+                get().addXP(xpEarned, `focus:${ended.id}`);
+                return;
+              }
+              set((s) => ({
+                user: {
+                  ...s.user,
+                  xpTotal: res.xp_total ?? s.user.xpTotal,
+                  level: res.level ?? s.user.level,
+                  rank: (res.rank as Rank | undefined) ?? s.user.rank,
+                  xpToNext: res.xp_to_next ?? s.user.xpToNext,
+                },
+              }));
+            })
+            .catch(() => {
+              get().addXP(xpEarned, `focus:${ended.id}`);
+            });
+        } else if (completed) {
+          get().addXP(xpEarned, `focus:${ended.id}`);
         }
 
-        // Persist
-        const userId = get().user.id;
+        // Persist session mirror for offline/history
         if (userId) focusRepo.save(userId, ended).catch(() => {});
       },
 
@@ -570,7 +659,7 @@ export const useShadowStore = create<ShadowStore>()(
         newLevel = tempLevel;
         const newXpToNext = tempNext;
         const newRank = getRankForLevel(newLevel);
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getLocalDateKey(new Date(), s.user.timezone);
 
         // FIX #10: Award 1 stat point per 5 levels gained
         const oldLevelTier = Math.floor(s.user.level / 5);
@@ -597,14 +686,14 @@ export const useShadowStore = create<ShadowStore>()(
 
       // #7 FIX: Date-based streak with grace day
       refreshStreakOnOpen: () => set((s) => {
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getLocalDateKey(new Date(), s.user.timezone);
         const { lastStreakDate, graceUsedAt, streak } = s;
 
         // Already active today
         if (lastStreakDate === today) return {};
 
         // Active yesterday → streak continues (will extend on next completion)
-        if (isYesterday(lastStreakDate)) return {};
+        if (isYesterday(lastStreakDate, s.user.timezone)) return {};
 
         // Missed yesterday — check grace
         if (lastStreakDate) {
@@ -628,7 +717,7 @@ export const useShadowStore = create<ShadowStore>()(
       }),
 
       recordQuestCompletion: () => set((s) => {
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getLocalDateKey(new Date(), s.user.timezone);
         const now = new Date().toISOString();
 
         // Streak: extend if not already recorded today
@@ -718,11 +807,15 @@ export const useShadowStore = create<ShadowStore>()(
         // Sync to backend (prefer server RPC if available)
         const userId = get().user.id;
         if (userId) {
-          supabase.rpc('unlock_skill_node', { p_node_key: node.key }).catch(() => {
-            // Fallback: manual sync
-            profilesRepo.update(userId, { statPoints: newStatPoints } as any).catch(() => {});
-            statsRepo.update(userId, newStats).catch(() => {});
-          });
+          void (async () => {
+            try {
+              await supabase.rpc('unlock_skill_node', { p_node_key: node.key });
+            } catch {
+              // Fallback: manual sync
+              profilesRepo.update(userId, { statPoints: newStatPoints } as any).catch(() => {});
+              statsRepo.update(userId, newStats).catch(() => {});
+            }
+          })();
         }
       },
 
@@ -762,7 +855,7 @@ export const useShadowStore = create<ShadowStore>()(
 
       generateDailyLog: () => {
         const { user, quests, focusHistory, checkins, streak, buffs } = get();
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getLocalDateKey(new Date(), user.timezone);
 
         // Don't duplicate
         const existing = get().dailyLogs.find((l) => l.logDate === today);
@@ -783,7 +876,7 @@ export const useShadowStore = create<ShadowStore>()(
         const dominantDebuff = todayCheckins.length > 0
           ? todayCheckins
               .map((c) => c.stateTag)
-              .filter((t) => t !== 'normal')
+              .filter((t) => t !== 'clear')
               .sort((a, b) =>
                 todayCheckins.filter((c) => c.stateTag === b).length -
                 todayCheckins.filter((c) => c.stateTag === a).length
@@ -832,9 +925,10 @@ export const useShadowStore = create<ShadowStore>()(
           await flushOutbox();
 
           // 2. FIX #8: Pull ALL domains, not just profile + quests
-          const [profile, prefs, userStats, quests, nodes, unlocked, rwds, achs] =
+          const [profile, progression, prefs, userStats, quests, nodes, unlocked, rwds, achs] =
             await Promise.allSettled([
               profilesRepo.fetch(uid),
+              profilesRepo.fetchProgression(uid),
               prefsRepo.fetch(uid),
               statsRepo.fetch(uid),
               questsRepo.fetchAll(uid),
@@ -849,6 +943,13 @@ export const useShadowStore = create<ShadowStore>()(
 
           if (profile.status === 'fulfilled' && profile.value) {
             updates.user = profile.value;
+          }
+          if (progression.status === 'fulfilled' && progression.value) {
+            updates.streak = progression.value.streak;
+            updates.combo = progression.value.combo;
+            updates.lastActiveDate = progression.value.lastActiveDate;
+            updates.lastStreakDate = progression.value.lastStreakDate;
+            updates.graceUsedAt = progression.value.graceUsedAt;
           }
           if (prefs.status === 'fulfilled' && prefs.value) {
             updates.preferences = prefs.value;
@@ -913,6 +1014,8 @@ export const useShadowStore = create<ShadowStore>()(
         currentState: state.currentState,
         buffs: state.buffs,
         focusHistory: state.focusHistory,
+        activeFocusSession: state.activeFocusSession,
+        completedFocusSessionIds: state.completedFocusSessionIds,
         streak: state.streak,
         combo: state.combo,
         todayXP: state.todayXP,
