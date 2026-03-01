@@ -16,6 +16,7 @@ import { useShadowStore } from '../store/useShadowStore';
 import {
   computeAllInsights, computeWeeklyFocusChart, generateAIAdvice,
 } from '../utils/analytics';
+import type { UserProfile } from '../types';
 
 // ═══════════════════════════════════════════════════
 // INSIGHTS SCREEN
@@ -235,14 +236,14 @@ export function SettingsScreen() {
           icon="🎨"
           options={THEME_OPTIONS as unknown as string[]}
           value={user.themeMode}
-          onChange={(v) => updateUser({ themeMode: v })}
+          onChange={(v) => updateUser({ themeMode: v as UserProfile['themeMode'] })}
         />
         <OptionPicker
           label="Play Style"
           icon="⚔️"
           options={PLAY_STYLE_OPTIONS as unknown as string[]}
           value={user.playStyle}
-          onChange={(v) => updateUser({ playStyle: v })}
+          onChange={(v) => updateUser({ playStyle: v as UserProfile['playStyle'] })}
         />
 
         {/* Notifications */}
@@ -252,7 +253,7 @@ export function SettingsScreen() {
           icon="🔔"
           options={REMINDER_OPTIONS as unknown as string[]}
           value={user.reminderStyle}
-          onChange={(v) => updateUser({ reminderStyle: v })}
+          onChange={(v) => updateUser({ reminderStyle: v as UserProfile['reminderStyle'] })}
         />
         <OptionPicker
           label="AI Tone"

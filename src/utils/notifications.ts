@@ -11,6 +11,7 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import { MMKV } from 'react-native-mmkv';
 import { supabase } from '../supabase/client';
+import { getLocalDateKey } from './date';
 import type { Quest, ReminderStyle } from '../types';
 
 const notifStore = new MMKV({ id: 'shadow-notifications' });
@@ -65,13 +66,25 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
   const { quests, reminderStyle, streak } = params;
   const now = new Date();
   const hour = now.getHours();
+  const todayKey = getLocalDateKey(now);
+  const currentTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const lastTz = notifStore.getString('last_tz');
+  if (lastTz && lastTz !== currentTz) {
+    notifStore.delete('last_plan');
+    notifStore.delete('daily_plan_ids');
+  }
 
   // FIX #4: Check dedupe FIRST — if already scheduled this hour, don't cancel + skip
-  const dedupeKey = `plan:${now.toISOString().slice(0, 13)}`;
+  const dedupeKey = `plan:${todayKey}:${hour}`;
   if (notifStore.getString('last_plan') === dedupeKey) return;
 
-  // Safe to cancel now — we WILL reschedule
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  // Replace only daily-plan notifications, do not wipe unrelated schedules.
+  const previousDailyIds = await pruneStoredNotificationIds('daily_plan_ids');
+  for (const id of previousDailyIds) {
+    await Notifications.cancelScheduledNotificationAsync(id).catch(() => {});
+  }
+  const nextDailyIds: string[] = [];
   notifStore.set('last_plan', dedupeKey);
 
   const activeQuests = quests.filter((q) => q.status === 'active' || q.status === 'in_progress');
@@ -83,14 +96,15 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
       : activeQuests.length > 0
         ? `${activeQuests.length} quest${activeQuests.length > 1 ? 's' : ''} on today's board. Time to hunt.`
         : 'No quests yet. Brain dump your chaos and create your first mission.';
-    await safeSchedule({
+    const id = await safeSchedule({
       content: { title: getTitle('morning', reminderStyle), body, data: { type: 'morning_kickoff' } },
       trigger: { hour: 9, minute: 0, repeats: false },
     });
+    if (id) nextDailyIds.push(id);
   }
 
   if (streak > 0 && hour < 20) {
-    await safeSchedule({
+    const id = await safeSchedule({
       content: {
         title: `🔥 ${streak}-day streak at risk`,
         body: getStreakBody(streak, reminderStyle),
@@ -98,6 +112,7 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
       },
       trigger: { hour: 20, minute: 0, repeats: false },
     });
+    if (id) nextDailyIds.push(id);
   }
 
   for (const quest of activeQuests) {
@@ -107,7 +122,7 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
     if (reminderTime <= now) continue;
     const secondsUntil = Math.round((reminderTime.getTime() - now.getTime()) / 1000);
     if (secondsUntil <= 0 || secondsUntil > 86400) continue;
-    await safeSchedule({
+    const dueId = await safeSchedule({
       content: {
         title: `⏰ "${quest.title}" due in 1 hour`,
         body: quest.questType === 'boss' ? 'The boss gate closes soon.' : 'Complete before the deadline.',
@@ -115,13 +130,14 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
       },
       trigger: { seconds: secondsUntil },
     });
+    if (dueId) nextDailyIds.push(dueId);
   }
 
   if (hour < 14) {
     const completedToday = quests.filter((q) =>
-      q.completedAt && q.completedAt.slice(0, 10) === now.toISOString().slice(0, 10)
+      q.completedAt && q.completedAt.slice(0, 10) === todayKey
     ).length;
-    await safeSchedule({
+    const id = await safeSchedule({
       content: {
         title: getTitle('afternoon', reminderStyle),
         body: completedToday > 0
@@ -131,7 +147,11 @@ export async function scheduleDailyPlan(params: DailyPlanParams): Promise<void> 
       },
       trigger: { hour: 14, minute: 0, repeats: false },
     });
+    if (id) nextDailyIds.push(id);
   }
+
+  notifStore.set('daily_plan_ids', JSON.stringify(nextDailyIds));
+  notifStore.set('last_tz', currentTz);
 }
 
 // ─── Focus Session Reminder ───
@@ -152,15 +172,50 @@ export async function scheduleFocusReminder(questTitle: string, minutes: number)
 // ─── Cancel All ───
 
 export async function cancelAllNotifications(): Promise<void> {
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  const dailyIds = getStoredNotificationIds('daily_plan_ids');
+  for (const id of dailyIds) {
+    await Notifications.cancelScheduledNotificationAsync(id).catch(() => {});
+  }
+  notifStore.delete('daily_plan_ids');
   notifStore.delete('last_plan');
 }
 
 // ─── Helpers ───
 
-async function safeSchedule(request: Notifications.NotificationRequestInput): Promise<void> {
-  try { await Notifications.scheduleNotificationAsync(request); }
-  catch (e) { console.warn('[Notifications] Failed to schedule:', e); }
+async function safeSchedule(request: Notifications.NotificationRequestInput): Promise<string | null> {
+  try {
+    return await Notifications.scheduleNotificationAsync(request);
+  } catch (e) {
+    console.warn('[Notifications] Failed to schedule:', e);
+    return null;
+  }
+}
+
+function getStoredNotificationIds(key: string): string[] {
+  const raw = notifStore.getString(key);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+
+async function pruneStoredNotificationIds(key: string): Promise<string[]> {
+  const ids = getStoredNotificationIds(key);
+  if (ids.length === 0) return [];
+
+  try {
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    const active = new Set(scheduled.map((n) => n.identifier));
+    const pruned = ids.filter((id) => active.has(id));
+    notifStore.set(key, JSON.stringify(pruned));
+    return pruned;
+  } catch {
+    return ids;
+  }
 }
 
 function getTitle(slot: 'morning' | 'afternoon', style: ReminderStyle): string {
