@@ -119,10 +119,7 @@ function QuestDetailContent() {
               <Animated.View key={step.id} entering={FadeInDown.delay(200 + index * 50).duration(300)}>
                 <GlassPanel
                   onPress={() => toggleStep(questId, step.id)}
-                  style={[
-                    styles.stepCard,
-                    isDone && { borderColor: `${COLORS.green}33`, opacity: 0.7 },
-                  ]}
+                  style={isDone ? { ...styles.stepCard, borderColor: `${COLORS.green}33`, opacity: 0.7 } : styles.stepCard}
                   padding={14}
                 >
                   <View style={styles.stepRow}>

@@ -104,7 +104,7 @@ export function computeCommonDebuff(checkins: StateCheckin[]): string {
 
   const tagCounts: Record<string, number> = {};
   for (const c of checkins) {
-    if (c.stateTag && c.stateTag !== 'normal') {
+    if (c.stateTag && c.stateTag !== 'clear') {
       tagCounts[c.stateTag] = (tagCounts[c.stateTag] || 0) + 1;
     }
   }

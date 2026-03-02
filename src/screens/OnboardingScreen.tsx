@@ -106,7 +106,7 @@ export default function OnboardingScreen() {
                   <Animated.View key={g} entering={FadeInDown.delay(i * 50).duration(250)} style={styles.gridHalf}>
                     <GlassPanel
                       onPress={() => toggleGoal(g)}
-                      style={[active && { borderColor: `${COLORS.cyan}55` }]}
+                      style={active ? { borderColor: `${COLORS.cyan}55` } : undefined}
                       padding={16}
                     >
                       <View style={{ alignItems: 'center' }}>
@@ -144,7 +144,7 @@ export default function OnboardingScreen() {
                   <Animated.View key={c} entering={FadeInDown.delay(i * 50).duration(250)}>
                     <GlassPanel
                       onPress={() => toggleChallenge(c)}
-                      style={[active && { borderColor: `${COLORS.red}55` }]}
+                      style={active ? { borderColor: `${COLORS.red}55` } : undefined}
                       padding={14}
                     >
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
@@ -181,7 +181,7 @@ export default function OnboardingScreen() {
                   <Animated.View key={r.key} entering={FadeInDown.delay(i * 80).duration(300)}>
                     <GlassPanel
                       onPress={() => setReminder(r.key)}
-                      style={[active && { borderColor: `${COLORS.purple}55` }]}
+                      style={active ? { borderColor: `${COLORS.purple}55` } : undefined}
                       padding={18}
                     >
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16 }}>

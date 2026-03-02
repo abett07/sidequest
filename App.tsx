@@ -58,6 +58,7 @@ export default function App() {
       await useShadowStore.getState().hydrateSession();
 
       useShadowStore.getState().refreshStreakOnOpen();
+      useShadowStore.getState().recoverActiveFocusSession();
       useShadowStore.getState().syncWithSupabase().catch(() => {});
 
       const uid = useShadowStore.getState().user.id;
@@ -94,6 +95,7 @@ export default function App() {
 function handleAppState(state: AppStateStatus) {
   if (state === 'active') {
     useShadowStore.getState().refreshStreakOnOpen();
+    useShadowStore.getState().recoverActiveFocusSession();
     useShadowStore.getState().syncWithSupabase().catch(() => {});
     useShadowStore.getState().generateDailyLog(); // Phase 4: auto daily summary
     scheduleNotifications();

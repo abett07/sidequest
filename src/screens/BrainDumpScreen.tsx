@@ -16,6 +16,7 @@ import { GlassPanel } from '../components/GlassPanel';
 import { ActionButton, Chip } from '../components/UIKit';
 import { COLORS, SPACING, FONTS, RADIUS } from '../constants/theme';
 import { useShadowStore } from '../store/useShadowStore';
+import type { QuestCategory } from '../types';
 import { aiBreakdown } from '../supabase/client';
 
 // ─── Quick Action Modifiers ───
@@ -46,6 +47,21 @@ function detectCategory(text: string): { category: string; color: string } {
 }
 
 // ─── Types ───
+
+
+const CATEGORY_TO_QUEST: Record<string, QuestCategory> = {
+  MEETING: 'work',
+  PROJECT: 'work',
+  URGENT: 'admin',
+  HEALTH: 'health',
+  CHORES: 'chores',
+  STUDY: 'study',
+  PERSONAL: 'social',
+};
+
+function toQuestCategory(category: string): QuestCategory {
+  return CATEGORY_TO_QUEST[category] || 'admin';
+}
 
 interface ParsedTask {
   id: string;
@@ -203,7 +219,7 @@ export function BrainDumpScreen() {
         userId: user.id,
         title: task.text,
         description: '',
-        category: task.category.toLowerCase() as any,
+        category: toQuestCategory(task.category),
         questType: (mod as any)?.questType || 'normal',
         status: (mod as any)?.status || 'active',
         priority: task.category === 'URGENT' ? 'high' : 'medium',
@@ -329,7 +345,7 @@ export function BrainDumpScreen() {
             {parsed.map((t, i) => (
               <Animated.View key={t.id} entering={SlideInRight.delay(i * 80).duration(250)}>
                 <Pressable onPress={() => toggleTask(t.id)}>
-                  <GlassPanel style={[styles.taskCard, !t.selected && styles.taskDeselected]} padding={14}>
+                  <GlassPanel style={!t.selected ? { ...styles.taskCard, ...styles.taskDeselected } : styles.taskCard} padding={14}>
                     <View style={styles.parsedRow}>
                       <Text style={{ fontSize: 18, opacity: t.selected ? 1 : 0.3 }}>
                         {t.selected ? '✅' : '⬜'}
